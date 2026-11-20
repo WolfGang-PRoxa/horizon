@@ -832,7 +832,7 @@
   "horizon.pvp.outline_opacity": "Opacité",
   "horizon.pvp.outline_opacity.tooltip": "À quel point le contour est opaque.",
   "horizon.pvp.outline_thickness": "Épaisseur",
-  "horizon.pvp.outline_thickness.tooltip": "La largeur du contour, en multiples de celui de vanilla.",
+  "horizon.pvp.outline_thickness.tooltip": "La largeur du contour, en multiples de celle de vanilla.",
   "horizon.pvp.preset": "Préréglage PvP",
   "horizon.pvp.preset.tooltip": "Active le réticule personnalisé, les widgets d'armure et d'effets, le sprint et l'accroupissement à bascule, le feu plus bas, et les mods compteur de FPS et touches s'ils sont installés. Vos réglages de chacun restent.",
   "horizon.pvp.shape.circle": "Cercle",

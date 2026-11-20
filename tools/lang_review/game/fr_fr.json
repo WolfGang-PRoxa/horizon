@@ -534,6 +534,7 @@
   "horizon.pvp.outline_opacity": "Opacité",
   "horizon.pvp.outline_opacity.tooltip": "À quel point le contour est opaque.",
   "horizon.pvp.outline_thickness": "Épaisseur",
+  "horizon.pvp.outline_thickness.tooltip": "La largeur du contour, en multiples de celle de vanilla.",
   "horizon.pvp.shape.circle": "Cercle",
   "horizon.pvp.shape.cross": "Croix",
   "horizon.pvp.shape.dot": "Point",
