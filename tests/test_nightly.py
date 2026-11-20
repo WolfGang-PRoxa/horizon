@@ -1,3 +1,4 @@
+import copy
 import datetime as dt
 import json
 import unittest
@@ -6,6 +7,7 @@ from pathlib import Path
 
 from tools.ci import nightly
 from tools.ci import nightly_set as ns
+from tests.test_ci_concurrency import yaml
 
 NOW = "2026-10-28T12:00:00+00:00"
 PATTERNS = ns.guarded_patterns((Path(__file__).resolve().parents[1] / ".github/CODEOWNERS").read_text())
@@ -48,6 +50,16 @@ class NightlyTests(unittest.TestCase):
                 {"tagName": "nightly-2026-10-15-extra", "isPrerelease": True}]
         self.assertEqual(nightly.stale(tags, dt.date(2026, 10, 28), 7), ["nightly-2026-10-20"])
 
+    def test_a_negative_retention_window_is_refused_and_today_is_never_pruned(self):
+        tags = [{"tagName": f"nightly-2026-11-{day:02d}", "isPrerelease": True} for day in range(10, 18)]
+        today = dt.date(2026, 11, 17)
+        self.assertEqual(nightly.stale(tags, today, 7), [])
+        # Even at a zero-day window the cutoff is today, so today's nightly is never older than it.
+        self.assertNotIn("nightly-2026-11-17", nightly.stale(tags, today, 0))
+        # A negative window used to move the cutoff into the future and doom every tag, today's included.
+        with self.assertRaisesRegex(ValueError, "non-negative"):
+            nightly.stale(tags, today, -1)
+
     def test_notes_list_what_reached_main_as_a_release_did(self):
         merged = [merged_pr(1, "Fix pistons", ["feature"], issues=[7]), merged_pr(2, "Water flows", []),
                   merged_pr(3, "CI only", ["skip-release"]), merged_pr(4, "Docs", [], paths=[])]
@@ -83,6 +95,46 @@ class NightlyTests(unittest.TestCase):
         self.assertEqual(nightly.stale([{"tagName": tag, "isPrerelease": True}], dt.date(2026, 11, 28), 7), [])
         self.assertIsNone(nightly.DATED.match(tag))
 
+
+class RotateTests(unittest.TestCase):
+    def test_fallback_tag_uses_utc_not_the_local_date(self):
+        # A runner west of UTC, after 17:00 UTC: the two calendars disagree by a day.
+        utc_today, local_today = dt.date(2026, 11, 17), dt.date(2026, 11, 16)
+        now_timezones = []
+
+        class FakeDateTime(dt.datetime):
+            @classmethod
+            def now(cls, tz=None):
+                now_timezones.append(tz)
+                return dt.datetime(utc_today.year, utc_today.month, utc_today.day, 12, 0, 0,
+                                   tzinfo=(tz or dt.timezone.utc))
+
+        class FakeDate(dt.date):
+            @classmethod
+            def today(cls):
+                return local_today
+
+        fake_dt = type("FakeDateTimeModule", (), {
+            "datetime": FakeDateTime, "date": FakeDate,
+            "timedelta": dt.timedelta, "timezone": dt.timezone,
+        })
+
+        calls = []
+        def fake_gh(*args, **kwargs):
+            calls.append(args)
+            if args[:3] == ("release", "view", "nightly"):
+                return json.dumps({"name": "Nightly - no date in this title"})
+            return ""
+
+        with mock.patch.object(nightly, "gh", fake_gh), \
+                mock.patch.object(nightly, "dt", fake_dt), \
+                mock.patch.dict(nightly.os.environ, {"GITHUB_REPOSITORY": "horizon-rust/horizon"}):
+            nightly.rotate()
+
+        rename = next(a for a in calls if a[:3] == ("release", "edit", "nightly"))
+        self.assertEqual(rename[-1], "nightly-" + str(utc_today - dt.timedelta(days=1)))
+        self.assertNotEqual(rename[-1], "nightly-" + str(local_today - dt.timedelta(days=1)))
+        self.assertEqual(now_timezones, [dt.timezone.utc])
 
 
 class ScheduledTests(unittest.TestCase):
@@ -144,6 +196,22 @@ class FirstNightlyTests(unittest.TestCase):
                 self.assertEqual("+refs/tags/nightly:refs/tags/nightly" in fetched, existing)
 
 
+def polytone_gate_bypasses(game, nightly_build):
+    """Where the Polytone tests could fail without holding the Nightly (game-build.yml's `polytone-windows`, called
+    through nightly-build.yml's `build`)."""
+    problems = []
+    job = game["jobs"]["polytone-windows"]
+    for where, part in [("job", job), *((f"step {i}", step) for i, step in enumerate(job["steps"]))]:
+        problems += [f"polytone-windows {where}: {key}" for key in ("if", "continue-on-error") if key in part]
+    for name in ("sign", "publish", "sdk-publish"):
+        gate = nightly_build["jobs"][name]
+        if "build" not in gate["needs"]:
+            problems.append(f"{name} doesn't need build")
+        condition = "".join(str(gate.get("if", "")).split())
+        problems += [f"{name} runs on {status}" for status in ("always()", "cancelled()", "failure()") if status in condition]
+    return problems
+
+
 class UntrustedBuildTests(unittest.TestCase):
     """A nightly can hold pull requests nobody reviewed: nothing its build leaves may reach a release (game-build.yml)."""
 
@@ -167,11 +235,41 @@ class UntrustedBuildTests(unittest.TestCase):
 
     def test_an_untrusted_build_never_runs_on_the_release_runner(self):
         runs_on = [line for line in self.game.splitlines() if "runs-on:" in line]
-        self.assertEqual(len(runs_on), 2)
+        self.assertEqual(len(runs_on), 4)
+        # The host-independent wasm member and the Polytone tests run on credential-free hosted runners.
+        hosted = [line for line in runs_on if line.strip() in ("runs-on: ubuntu-22.04", "runs-on: windows-latest")]
+        self.assertEqual(len(hosted), 2)
         # The nightly's own runner: never the release runner, and never behind pull requests' parity queue.
         nightly_runner = "fromJSON('[\"self-hosted\", \"macOS\", \"horizon-nightly\"]')"
         for line in runs_on:
+            if line in hosted:
+                continue
             self.assertIn(f"inputs.trusted && vars.MAC_RUNNER || {nightly_runner}", line)
+
+    def test_the_polytone_tests_hold_the_nightly_as_the_windows_build_does(self):
+        # Their own job beside the Windows build: whatever it was given, a failure must still fail the called
+        # workflow, which sign, publish and sdk-publish need.
+        game = yaml.safe_load(self.game)
+        nightly_build = yaml.safe_load((WORKFLOWS / "nightly-build.yml").read_text())
+        job = game["jobs"]["polytone-windows"]
+        self.assertEqual(job["runs-on"], "windows-latest")
+        self.assertEqual(job["env"]["RUSTFLAGS"], "-C target-feature=+crt-static")
+        self.assertEqual(job["steps"][-1]["run"].strip(),
+                         "cargo test --release --locked -p horizon-client-render --lib particles::polytone::tests::")
+        self.assertEqual(polytone_gate_bypasses(game, nightly_build), [])
+        # Each way around the gate is caught: a step or job allowed to fail, a skipped test, a publishing job that
+        # runs after a failed build.
+        for bypass in ({"step": {"continue-on-error": True}}, {"step": {"if": "github.event_name == 'schedule'"}},
+                       {"job": {"continue-on-error": True}}, {"job": {"if": "${{ inputs.trusted }}"}},
+                       {"sign": {"if": "${{ !cancelled() }}"}}, {"publish": {"if": "always() && true"}},
+                       {"sdk-publish": {"if": "failure() || needs.sdk.outputs.needed == 'true'"}},
+                       {"sign": {"needs": ["pick", "sdk-index"]}}):
+            with self.subTest(bypass=bypass):
+                mutated_game, mutated_build = copy.deepcopy(game), copy.deepcopy(nightly_build)
+                [(where, change)] = bypass.items()
+                polytone = mutated_game["jobs"]["polytone-windows"]
+                {"step": polytone["steps"][-1], "job": polytone}.get(where, mutated_build["jobs"].get(where)).update(change)
+                self.assertNotEqual(polytone_gate_bypasses(mutated_game, mutated_build), [])
 
     def test_a_trusted_build_never_reads_the_shared_sccache(self):
         calls = self.game.count("bash tools/ci/runner-env.sh")
@@ -278,7 +376,7 @@ class SdkPairTests(unittest.TestCase):
                 nightly.build_set(nightly.Ref("main", "a" * 40, T), [], [], "2026-11-11", True, False)
             push.assert_not_called()
 
-    def test_publication_checks_fresh_inventory_and_leaves_upstream_unchanged(self):
+    def test_publication_checks_fresh_inventory_for_the_current_repository(self):
         with mock.patch.dict(nightly.os.environ, {"GITHUB_REPOSITORY": "horizon-rust/horizon"}), \
                 mock.patch.object(nightly, "ready_sdk_shas", side_effect=[{"a" * 40}, set()]) as inventory, \
                 mock.patch.object(nightly, "published_index") as index:
@@ -287,10 +385,12 @@ class SdkPairTests(unittest.TestCase):
             with self.assertRaisesRegex(SystemExit, "publication refused"):
                 nightly.require_sdk("a" * 40)
             self.assertEqual(inventory.call_count, 2)
-        with mock.patch.dict(nightly.os.environ, {"GITHUB_REPOSITORY": "someone/horizon"}), \
-                mock.patch.object(nightly, "sdk_ready") as sdk:
+        with mock.patch.object(nightly.train, "REPO", "someone/horizon"), \
+                mock.patch.object(nightly, "sdk_ready", return_value=True) as sdk, \
+                mock.patch.object(nightly, "published_index") as index:
             nightly.require_sdk("a" * 40)
-            sdk.assert_not_called()
+            sdk.assert_called_once_with("a" * 40)
+            index.assert_called_once_with("a" * 40)
 
     def test_the_sdk_index_must_name_this_build_format_and_assets_and_match_its_sums(self):
         import hashlib
